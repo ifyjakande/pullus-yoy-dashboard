@@ -1,0 +1,31 @@
+# Credentials and config (NEVER commit these)
+*.json
+local_config.json
+pullus-pipeline-*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+.env
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Allow workflow files
+!.github/**/*.yml
