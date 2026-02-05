@@ -921,8 +921,6 @@ def format_percentage(value):
     """Format value as percentage string."""
     if pd.isna(value):
         return "-"
-    if value >= 0:
-        return f"{value:.1f}%"
     return f"{value:.1f}%"
 
 
