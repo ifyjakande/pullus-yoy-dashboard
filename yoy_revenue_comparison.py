@@ -63,6 +63,12 @@ MONTH_ORDER = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'O
 # Hash file path (relative to script directory)
 HASH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.last_hash')
 
+# Sales Rep Dashboard hash file
+SALES_REP_HASH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.sales_rep_hash')
+
+# Sales Rep Dashboard sheet name
+SALES_REP_SHEET_NAME = "Sales Rep Targets vs Actuals"
+
 
 def load_config():
     """
@@ -158,6 +164,20 @@ def store_hash(hash_value):
         f.write(hash_value)
 
 
+def get_sales_rep_stored_hash():
+    """Retrieve stored hash from sales rep hash file."""
+    if os.path.exists(SALES_REP_HASH_FILE):
+        with open(SALES_REP_HASH_FILE, 'r') as f:
+            return f.read().strip()
+    return None
+
+
+def store_sales_rep_hash(hash_value):
+    """Store hash in sales rep hash file."""
+    with open(SALES_REP_HASH_FILE, 'w') as f:
+        f.write(hash_value)
+
+
 def smart_retry(max_retries=5, initial_delay=2.0):
     """
     Smart retry decorator that only adds delays when API calls actually fail.
@@ -196,10 +216,15 @@ def smart_retry(max_retries=5, initial_delay=2.0):
 
 
 @smart_retry(max_retries=3, initial_delay=1.0)
-def extract_2026_revenue(config):
+def extract_2026_revenue(config, preserve_staff_identity=False):
     """
     Extract 2026 sales data from all staff sheets.
     Returns a DataFrame with date, month, product_type, and amount columns.
+
+    Args:
+        config: Configuration dictionary with staff_sheets
+        preserve_staff_identity: If True, adds 'staff_name' and 'sheet_id' columns
+                                 instead of generic 'source' column
 
     Logging is sanitized - no sheet IDs or staff names in output.
     """
@@ -209,7 +234,7 @@ def extract_2026_revenue(config):
     staff_sheets = config.get('staff_sheets', {})
     total_sources = len(staff_sheets)
 
-    for i, (sheet_id, _) in enumerate(staff_sheets.items()):
+    for i, (sheet_id, staff_name) in enumerate(staff_sheets.items()):
         source_num = i + 1
         try:
             if i > 0:
@@ -305,8 +330,12 @@ def extract_2026_revenue(config):
             # Remove rows with zero amount
             df = df[df['amount'] > 0]
 
-            # Add source identifier (anonymized)
-            df['source'] = f"source_{source_num}"
+            # Add source identifier
+            if preserve_staff_identity:
+                df['staff_name'] = staff_name
+                df['sheet_id'] = sheet_id
+            else:
+                df['source'] = f"source_{source_num}"
 
             if not df.empty:
                 all_dataframes.append(df)
@@ -386,6 +415,494 @@ def filter_chicken_egg(df):
     return chicken_df, egg_df
 
 
+def aggregate_by_staff_quarter_product(df, rep_config):
+    """
+    Aggregate revenue by staff, quarter, and product type.
+
+    Args:
+        df: DataFrame with staff_name, sheet_id, month, product_type, amount columns
+        rep_config: Dictionary mapping sheet_id to rep configuration
+
+    Returns:
+        Dictionary: {sheet_id: {quarter: {egg: amount, wc: amount}}}
+    """
+    if df.empty:
+        return {}
+
+    quarter_mapping = {
+        'Jan': 'Q1', 'Feb': 'Q1', 'Mar': 'Q1',
+        'Apr': 'Q2', 'May': 'Q2', 'Jun': 'Q2',
+        'Jul': 'Q3', 'Aug': 'Q3', 'Sep': 'Q3',
+        'Oct': 'Q4', 'Nov': 'Q4', 'Dec': 'Q4'
+    }
+
+    result = {}
+
+    # Filter only for reps in config
+    rep_sheet_ids = set(rep_config.keys())
+
+    for sheet_id in rep_sheet_ids:
+        result[sheet_id] = {
+            'Q1': {'egg': 0, 'wc': 0},
+            'Q2': {'egg': 0, 'wc': 0},
+            'Q3': {'egg': 0, 'wc': 0},
+            'Q4': {'egg': 0, 'wc': 0}
+        }
+
+    # Filter for relevant sheet_ids
+    df_filtered = df[df['sheet_id'].isin(rep_sheet_ids)].copy()
+
+    if df_filtered.empty:
+        return result
+
+    # Add quarter column
+    df_filtered['quarter'] = df_filtered['month'].map(quarter_mapping)
+
+    # Normalize product type
+    df_filtered['product_category'] = df_filtered['product_type'].str.lower().str.strip()
+
+    for _, row in df_filtered.iterrows():
+        sheet_id = row['sheet_id']
+        quarter = row['quarter']
+        product = row['product_category']
+        amount = row['amount']
+
+        if quarter is None or sheet_id not in result:
+            continue
+
+        if product == 'whole chicken':
+            result[sheet_id][quarter]['wc'] += amount
+        elif product in ['egg', 'eggs']:
+            result[sheet_id][quarter]['egg'] += amount
+
+    return result
+
+
+@smart_retry(max_retries=3, initial_delay=2.0)
+def create_sales_rep_dashboard(config, staff_actuals):
+    """
+    Create or update the Sales Rep Targets vs Actuals dashboard.
+
+    Args:
+        config: Configuration dictionary with sales_rep_dashboard section
+        staff_actuals: Dictionary from aggregate_by_staff_quarter_product()
+
+    Returns:
+        Tuple of (worksheet, formatting_data)
+    """
+    rep_config = config['sales_rep_dashboard']['reps']
+    target_sheet_id = config['sales_rep_dashboard']['target_spreadsheet_id']
+
+    gc = get_google_sheets_client()
+
+    print("  Opening sales rep target spreadsheet...")
+    spreadsheet = gc.open_by_key(target_sheet_id)
+
+    # Check if old sheet exists (we'll delete it after creating the new one)
+    old_worksheet = None
+    try:
+        old_worksheet = spreadsheet.worksheet(SALES_REP_SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+
+    # Create new sheet with temporary name first
+    temp_name = f"{SALES_REP_SHEET_NAME}_temp_{int(time.time())}"
+    print("  Creating sheet...")
+    worksheet = spreadsheet.add_worksheet(title=temp_name, rows=50, cols=10)
+    time.sleep(1.0)
+
+    # Now delete the old sheet (safe because we have the new one)
+    if old_worksheet:
+        print("  Removing old sheet...")
+        spreadsheet.del_worksheet(old_worksheet)
+        time.sleep(1.0)
+
+    # Rename the new sheet to the proper name
+    worksheet.update_title(SALES_REP_SHEET_NAME)
+    time.sleep(1.0)
+
+    # Build data
+    all_data = []
+    formatting_data = []
+
+    # Row 1: Title
+    all_data.append(["SALES REP TARGETS VS ACTUALS DASHBOARD", "", "", "", "", "", "", "", ""])
+
+    # Row 2: Empty
+    all_data.append([""])
+
+    # Row 3: Last Updated
+    all_data.append([f"Last Updated: {datetime.now(WAT).strftime('%d-%b-%Y %I:%M %p')} WAT"])
+
+    # Row 4: Empty
+    all_data.append([""])
+
+    # Row 5: Headers
+    all_data.append([
+        "Name",
+        "Location",
+        "Business Contribution %",
+        "Quarterly Target Eggs",
+        "Quarterly Targets WC",
+        "Total Target (Egg+WC)",
+        "Total Achieved",
+        "Percentage Achieved%",
+        "Gap"
+    ])
+
+    # Data rows: Each rep x 4 quarters + rep total + grand total
+    quarters = ['Q1', 'Q2', 'Q3', 'Q4']
+
+    # Track grand totals (only for quarters with data)
+    grand_egg_target = 0
+    grand_wc_target = 0
+    grand_total_target = 0
+    grand_total_achieved = 0
+
+    for sheet_id, rep_info in rep_config.items():
+        rep_name = rep_info['name']
+        location = rep_info['location']
+        contribution = rep_info['business_contribution']
+        egg_target = rep_info['quarterly_targets']['egg']
+        wc_target = rep_info['quarterly_targets']['wc']
+        total_target = egg_target + wc_target
+
+        # Track rep yearly totals (quarterly × 4)
+        rep_yearly_egg_target = egg_target * 4
+        rep_yearly_wc_target = wc_target * 4
+        rep_yearly_total_target = total_target * 4
+        rep_total_achieved = 0
+
+        for quarter in quarters:
+            # Get actuals
+            if sheet_id in staff_actuals:
+                egg_actual = staff_actuals[sheet_id][quarter]['egg']
+                wc_actual = staff_actuals[sheet_id][quarter]['wc']
+            else:
+                egg_actual = 0
+                wc_actual = 0
+
+            total_actual = egg_actual + wc_actual
+            rep_total_achieved += total_actual
+
+            # Format the name with quarter
+            name_with_quarter = f"{rep_name} ({quarter})"
+
+            # Only calculate percentage and gap if there's actual data
+            if total_actual > 0:
+                percentage = (total_actual / total_target) * 100 if total_target > 0 else 0
+                gap = total_actual - total_target
+
+                row_data = [
+                    name_with_quarter,
+                    location,
+                    f"{contribution * 100:.0f}%",
+                    format_currency(egg_target),
+                    format_currency(wc_target),
+                    format_currency(total_target),
+                    format_currency(total_actual),
+                    f"{percentage:.1f}%",
+                    format_currency(gap)
+                ]
+
+                # Track formatting data (only for rows with actual data)
+                formatting_data.append({
+                    'row_has_data': True,
+                    'is_total_row': False,
+                    'percentage': percentage,
+                    'gap': gap
+                })
+            else:
+                # No actual data for this quarter - show dashes
+                row_data = [
+                    name_with_quarter,
+                    location,
+                    f"{contribution * 100:.0f}%",
+                    format_currency(egg_target),
+                    format_currency(wc_target),
+                    format_currency(total_target),
+                    "-",
+                    "-",
+                    "-"
+                ]
+
+                # No conditional formatting needed for empty rows
+                formatting_data.append({
+                    'row_has_data': False,
+                    'is_total_row': False,
+                    'percentage': 0,
+                    'gap': 0
+                })
+
+            all_data.append(row_data)
+
+        # Add rep total row (yearly targets, actual achieved so far)
+        if rep_total_achieved > 0:
+            rep_percentage = (rep_total_achieved / rep_yearly_total_target) * 100 if rep_yearly_total_target > 0 else 0
+            rep_gap = rep_total_achieved - rep_yearly_total_target
+
+            rep_total_row = [
+                f"{rep_name} TOTAL",
+                "-",
+                "-",
+                format_currency(rep_yearly_egg_target),
+                format_currency(rep_yearly_wc_target),
+                format_currency(rep_yearly_total_target),
+                format_currency(rep_total_achieved),
+                f"{rep_percentage:.1f}%",
+                format_currency(rep_gap)
+            ]
+
+            formatting_data.append({
+                'row_has_data': True,
+                'is_total_row': True,
+                'percentage': rep_percentage,
+                'gap': rep_gap
+            })
+        else:
+            # No data for any quarter - still show yearly targets
+            rep_total_row = [
+                f"{rep_name} TOTAL",
+                "-",
+                "-",
+                format_currency(rep_yearly_egg_target),
+                format_currency(rep_yearly_wc_target),
+                format_currency(rep_yearly_total_target),
+                "-",
+                "-",
+                "-"
+            ]
+
+            formatting_data.append({
+                'row_has_data': False,
+                'is_total_row': True,
+                'percentage': 0,
+                'gap': 0
+            })
+
+        all_data.append(rep_total_row)
+
+        # Add to grand totals (yearly)
+        grand_egg_target += rep_yearly_egg_target
+        grand_wc_target += rep_yearly_wc_target
+        grand_total_target += rep_yearly_total_target
+        grand_total_achieved += rep_total_achieved
+
+    # Add grand total row
+    if grand_total_achieved > 0:
+        grand_percentage = (grand_total_achieved / grand_total_target) * 100 if grand_total_target > 0 else 0
+        grand_gap = grand_total_achieved - grand_total_target
+
+        grand_total_row = [
+            "GRAND TOTAL",
+            "-",
+            "-",
+            format_currency(grand_egg_target),
+            format_currency(grand_wc_target),
+            format_currency(grand_total_target),
+            format_currency(grand_total_achieved),
+            f"{grand_percentage:.1f}%",
+            format_currency(grand_gap)
+        ]
+
+        formatting_data.append({
+            'row_has_data': True,
+            'is_total_row': True,
+            'percentage': grand_percentage,
+            'gap': grand_gap
+        })
+    else:
+        grand_total_row = [
+            "GRAND TOTAL",
+            "-",
+            "-",
+            format_currency(grand_egg_target),
+            format_currency(grand_wc_target),
+            format_currency(grand_total_target),
+            "-",
+            "-",
+            "-"
+        ]
+
+        formatting_data.append({
+            'row_has_data': False,
+            'is_total_row': True,
+            'percentage': 0,
+            'gap': 0
+        })
+
+    all_data.append(grand_total_row)
+
+    # Write all data
+    print("  Writing data...")
+    worksheet.update('A1', all_data, value_input_option='RAW')
+    time.sleep(1.0)
+
+    return worksheet, formatting_data
+
+
+def apply_sales_rep_formatting(worksheet, formatting_data):
+    """
+    Apply professional formatting to the sales rep dashboard.
+
+    Args:
+        worksheet: The gspread worksheet object
+        formatting_data: List of dicts with 'percentage' and 'gap' values for each data row
+    """
+    print("  Applying formatting (batch mode)...")
+
+    # Define formats
+    title_format = CellFormat(
+        backgroundColor=Color(**COLORS['title']),
+        textFormat=TextFormat(bold=True, fontSize=14, foregroundColor=Color(1, 1, 1)),
+        horizontalAlignment='CENTER'
+    )
+
+    updated_format = CellFormat(
+        textFormat=TextFormat(italic=True, fontSize=10),
+        horizontalAlignment='LEFT'
+    )
+
+    header_format = CellFormat(
+        backgroundColor=Color(**COLORS['subheader']),
+        textFormat=TextFormat(bold=True, fontSize=10),
+        horizontalAlignment='CENTER',
+        borders=Borders(
+            top=Border('SOLID', Color(0.7, 0.7, 0.7)),
+            bottom=Border('SOLID', Color(0.7, 0.7, 0.7)),
+            left=Border('SOLID', Color(0.7, 0.7, 0.7)),
+            right=Border('SOLID', Color(0.7, 0.7, 0.7))
+        )
+    )
+
+    data_format = CellFormat(
+        backgroundColor=Color(**COLORS['data']),
+        horizontalAlignment='RIGHT',
+        borders=Borders(
+            top=Border('SOLID', Color(0.85, 0.85, 0.85)),
+            bottom=Border('SOLID', Color(0.85, 0.85, 0.85)),
+            left=Border('SOLID', Color(0.85, 0.85, 0.85)),
+            right=Border('SOLID', Color(0.85, 0.85, 0.85))
+        )
+    )
+
+    name_format = CellFormat(
+        backgroundColor=Color(**COLORS['data']),
+        horizontalAlignment='LEFT',
+        borders=Borders(
+            top=Border('SOLID', Color(0.85, 0.85, 0.85)),
+            bottom=Border('SOLID', Color(0.85, 0.85, 0.85)),
+            left=Border('SOLID', Color(0.85, 0.85, 0.85)),
+            right=Border('SOLID', Color(0.85, 0.85, 0.85))
+        )
+    )
+
+    green_format = CellFormat(
+        backgroundColor=Color(**COLORS['positive']),
+        textFormat=TextFormat(bold=True)
+    )
+
+    red_format = CellFormat(
+        backgroundColor=Color(**COLORS['negative']),
+        textFormat=TextFormat(bold=True)
+    )
+
+    total_row_format = CellFormat(
+        backgroundColor=Color(**COLORS['total_row']),
+        textFormat=TextFormat(bold=True),
+        horizontalAlignment='RIGHT',
+        borders=Borders(
+            top=Border('SOLID', Color(0.5, 0.5, 0.5)),
+            bottom=Border('SOLID', Color(0.5, 0.5, 0.5)),
+            left=Border('SOLID', Color(0.5, 0.5, 0.5)),
+            right=Border('SOLID', Color(0.5, 0.5, 0.5))
+        )
+    )
+
+    total_row_name_format = CellFormat(
+        backgroundColor=Color(**COLORS['total_row']),
+        textFormat=TextFormat(bold=True),
+        horizontalAlignment='LEFT',
+        borders=Borders(
+            top=Border('SOLID', Color(0.5, 0.5, 0.5)),
+            bottom=Border('SOLID', Color(0.5, 0.5, 0.5)),
+            left=Border('SOLID', Color(0.5, 0.5, 0.5)),
+            right=Border('SOLID', Color(0.5, 0.5, 0.5))
+        )
+    )
+
+    # Calculate the last row (5 header rows + data rows)
+    num_data_rows = len(formatting_data)
+    last_data_row = 5 + num_data_rows
+
+    # Batch 1: Base formatting
+    base_formats = [
+        ('A1:I1', title_format),
+        ('A3:I3', updated_format),
+        ('A5:I5', header_format),
+        (f'A6:A{last_data_row}', name_format),
+        (f'B6:I{last_data_row}', data_format),
+    ]
+
+    format_cell_ranges(worksheet, base_formats)
+    time.sleep(2.0)
+
+    # Merge title cells
+    worksheet.merge_cells('A1:I1')
+    time.sleep(1.0)
+
+    # Batch 2: Total row formatting
+    total_row_formats = []
+    for i, fmt_data in enumerate(formatting_data):
+        row = 6 + i  # Data starts at row 6
+        if fmt_data.get('is_total_row', False):
+            total_row_formats.append((f'A{row}', total_row_name_format))
+            total_row_formats.append((f'B{row}:I{row}', total_row_format))
+
+    if total_row_formats:
+        format_cell_ranges(worksheet, total_row_formats)
+        time.sleep(2.0)
+
+    # Batch 3: Conditional formatting for percentage and gap columns (only for rows with data)
+    conditional_formats = []
+
+    for i, fmt_data in enumerate(formatting_data):
+        row = 6 + i  # Data starts at row 6
+
+        # Only apply conditional formatting to rows with actual data
+        if fmt_data.get('row_has_data', False):
+            # Percentage column (H) - green if >= 100%, red if < 100%
+            pct_fmt = green_format if fmt_data['percentage'] >= 100 else red_format
+            conditional_formats.append((f'H{row}', pct_fmt))
+
+            # Gap column (I) - green if >= 0, red if < 0
+            gap_fmt = green_format if fmt_data['gap'] >= 0 else red_format
+            conditional_formats.append((f'I{row}', gap_fmt))
+
+    if conditional_formats:
+        format_cell_ranges(worksheet, conditional_formats)
+        time.sleep(2.0)
+
+    # Set column widths
+    widths = [
+        ('A', 150),  # Name
+        ('B', 110),  # Location
+        ('C', 180),  # Business Contribution
+        ('D', 180),  # Quarterly Target Eggs
+        ('E', 180),  # Quarterly Targets WC
+        ('F', 190),  # Total Target
+        ('G', 160),  # Total Achieved
+        ('H', 180),  # Percentage Achieved
+        ('I', 180),  # Gap
+    ]
+    for col, width in widths:
+        set_column_width(worksheet, col, width)
+    time.sleep(1.0)
+
+    # Freeze header rows
+    set_frozen(worksheet, rows=5)
+
+
 def calculate_yoy_variance(current, previous):
     """Calculate year-over-year variance percentage."""
     if previous == 0:
@@ -420,18 +937,27 @@ def create_comparison_sheet(config, monthly_2026, quarterly_2026, chicken_quarte
     print("  Opening target spreadsheet...")
     spreadsheet = gc.open_by_key(target_spreadsheet_id)
 
-    # Check if sheet exists, delete and recreate it to clear all data AND formatting
+    # Check if old sheet exists (we'll delete it after creating the new one)
+    old_worksheet = None
     try:
-        worksheet = spreadsheet.worksheet(TARGET_SHEET_NAME)
-        print("  Clearing existing sheet...")
-        spreadsheet.del_worksheet(worksheet)
-        time.sleep(1.0)
+        old_worksheet = spreadsheet.worksheet(TARGET_SHEET_NAME)
     except gspread.exceptions.WorksheetNotFound:
         pass
 
+    # Create new sheet with temporary name first
+    temp_name = f"{TARGET_SHEET_NAME}_temp_{int(time.time())}"
     print("  Creating sheet...")
-    worksheet = spreadsheet.add_worksheet(title=TARGET_SHEET_NAME, rows=50, cols=15)
+    worksheet = spreadsheet.add_worksheet(title=temp_name, rows=50, cols=15)
+    time.sleep(1.0)
 
+    # Now delete the old sheet (safe because we have the new one)
+    if old_worksheet:
+        print("  Removing old sheet...")
+        spreadsheet.del_worksheet(old_worksheet)
+        time.sleep(1.0)
+
+    # Rename the new sheet to the proper name
+    worksheet.update_title(TARGET_SHEET_NAME)
     time.sleep(1.0)
 
     # Build all data for the sheet
@@ -806,9 +1332,9 @@ def apply_professional_formatting(worksheet, target_percentages=None, monthly_va
 
 
 def main():
-    """Main function to generate the YoY Revenue Comparison sheet."""
+    """Main function to generate dashboards."""
     print("=" * 50)
-    print("YoY Revenue Comparison Sync")
+    print("Dashboard Sync")
     print("=" * 50)
 
     # Load configuration
@@ -820,61 +1346,109 @@ def main():
         print(f"Configuration error: {type(e).__name__}")
         sys.exit(1)
 
-    # Step 1: Extract 2026 data from staff sheets
+    # Step 1: Extract 2026 data from staff sheets (with staff identity for both dashboards)
     print("\nStep 1: Extracting 2026 revenue data...")
-    df_2026 = extract_2026_revenue(config)
+    df_2026 = extract_2026_revenue(config, preserve_staff_identity=True)
 
     if df_2026.empty:
         print("  Warning: No data extracted")
-        monthly_2026 = {month: 0 for month in MONTH_ORDER}
-        quarterly_2026 = {'Q1': 0, 'Q2': 0, 'Q3': 0, 'Q4': 0}
-        chicken_quarterly_2026 = {'Q1': 0, 'Q2': 0, 'Q3': 0, 'Q4': 0}
-        egg_quarterly_2026 = {'Q1': 0, 'Q2': 0, 'Q3': 0, 'Q4': 0}
         current_hash = "empty"
     else:
         record_count = len(df_2026)
         print(f"  Total records: {record_count}")
-
-        # Compute hash of extracted data
         current_hash = compute_data_hash(df_2026)
 
-        # Step 2: Check if data has changed
-        stored_hash = get_stored_hash()
-        if stored_hash == current_hash:
-            print("\nNo changes detected - skipping update")
-            print("=" * 50)
-            return
+    # ============================================================
+    # YOY REVENUE COMPARISON DASHBOARD
+    # ============================================================
+    print("\n" + "=" * 50)
+    print("YoY Revenue Comparison Sync")
+    print("=" * 50)
 
-        print("\nChanges detected - proceeding with update...")
+    stored_hash = get_stored_hash()
+    if stored_hash == current_hash:
+        print("\nNo changes detected - skipping YoY dashboard update")
+    else:
+        if df_2026.empty:
+            monthly_2026 = {month: 0 for month in MONTH_ORDER}
+            quarterly_2026 = {'Q1': 0, 'Q2': 0, 'Q3': 0, 'Q4': 0}
+            chicken_quarterly_2026 = {'Q1': 0, 'Q2': 0, 'Q3': 0, 'Q4': 0}
+            egg_quarterly_2026 = {'Q1': 0, 'Q2': 0, 'Q3': 0, 'Q4': 0}
+        else:
+            print("\nChanges detected - proceeding with YoY dashboard update...")
 
-        # Aggregate data
-        monthly_2026 = aggregate_by_month(df_2026)
-        quarterly_2026 = aggregate_by_quarter(df_2026)
+            # Aggregate data
+            monthly_2026 = aggregate_by_month(df_2026)
+            quarterly_2026 = aggregate_by_quarter(df_2026)
 
-        chicken_df, egg_df = filter_chicken_egg(df_2026)
-        print(f"  Chicken records: {len(chicken_df)}")
-        print(f"  Egg records: {len(egg_df)}")
+            chicken_df, egg_df = filter_chicken_egg(df_2026)
+            print(f"  Chicken records: {len(chicken_df)}")
+            print(f"  Egg records: {len(egg_df)}")
 
-        chicken_quarterly_2026 = aggregate_by_quarter(chicken_df)
-        egg_quarterly_2026 = aggregate_by_quarter(egg_df)
+            chicken_quarterly_2026 = aggregate_by_quarter(chicken_df)
+            egg_quarterly_2026 = aggregate_by_quarter(egg_df)
 
-    # Step 3: Create the comparison sheet
-    print("\nStep 2: Updating dashboard...")
-    worksheet, target_percentages, monthly_variances, quarterly_variances = create_comparison_sheet(
-        config, monthly_2026, quarterly_2026,
-        chicken_quarterly_2026, egg_quarterly_2026
-    )
+        # Create the comparison sheet
+        print("\nStep 2: Updating YoY dashboard...")
+        worksheet, target_percentages, monthly_variances, quarterly_variances = create_comparison_sheet(
+            config, monthly_2026, quarterly_2026,
+            chicken_quarterly_2026, egg_quarterly_2026
+        )
 
-    # Step 4: Apply professional formatting
-    print("\nStep 3: Applying formatting...")
-    apply_professional_formatting(worksheet, target_percentages, monthly_variances, quarterly_variances)
+        # Apply professional formatting
+        print("\nStep 3: Applying formatting...")
+        apply_professional_formatting(worksheet, target_percentages, monthly_variances, quarterly_variances)
 
-    # Step 5: Store the new hash
-    store_hash(current_hash)
-    print("\nHash updated")
+        # Store the new hash
+        store_hash(current_hash)
+        print("\nYoY hash updated")
+
+        print("\n" + "=" * 50)
+        print("YoY Dashboard updated successfully")
+        print("=" * 50)
+
+    # ============================================================
+    # SALES REP TARGETS VS ACTUALS DASHBOARD (separate output)
+    # ============================================================
+    if 'sales_rep_dashboard' in config:
+        print("\n" + "=" * 50)
+        print("Sales Rep Targets vs Actuals Sync")
+        print("=" * 50)
+
+        rep_config = config['sales_rep_dashboard'].get('reps', {})
+        if not rep_config:
+            print("  No sales rep configuration found - skipping")
+        else:
+            # Check if sales rep data has changed (same source data, separate hash)
+            stored_sales_rep_hash = get_sales_rep_stored_hash()
+            if stored_sales_rep_hash == current_hash:
+                print("\nNo changes detected - skipping sales rep dashboard update")
+            elif df_2026.empty:
+                print("  Warning: No data for sales rep dashboard")
+            else:
+                print("\nChanges detected - proceeding with sales rep dashboard update...")
+
+                # Aggregate by staff, quarter, and product
+                staff_actuals = aggregate_by_staff_quarter_product(df_2026, rep_config)
+
+                # Create the sales rep dashboard
+                print("\nStep 2: Updating sales rep dashboard...")
+                worksheet, formatting_data = create_sales_rep_dashboard(config, staff_actuals)
+
+                # Apply formatting
+                print("\nStep 3: Applying formatting...")
+                apply_sales_rep_formatting(worksheet, formatting_data)
+
+                # Store the new hash
+                store_sales_rep_hash(current_hash)
+                print("\nSales rep hash updated")
+
+                print("\n" + "=" * 50)
+                print("Sales Rep Dashboard updated successfully")
+                print("=" * 50)
 
     print("\n" + "=" * 50)
-    print("Dashboard updated successfully")
+    print("All dashboard sync complete")
     print("=" * 50)
 
 
