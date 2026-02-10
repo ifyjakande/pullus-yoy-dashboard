@@ -60,11 +60,24 @@ COLORS = {
 # Month order for sorting
 MONTH_ORDER = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
+# Conditional formatting for positive/negative values
+GREEN_FORMAT = CellFormat(
+    backgroundColor=Color(**COLORS['positive']),
+    textFormat=TextFormat(bold=True)
+)
+RED_FORMAT = CellFormat(
+    backgroundColor=Color(**COLORS['negative']),
+    textFormat=TextFormat(bold=True)
+)
+
+# Script directory (for relative file paths)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Hash file path (relative to script directory)
-HASH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.last_hash')
+HASH_FILE = os.path.join(SCRIPT_DIR, '.last_hash')
 
 # Sales Rep Dashboard hash file
-SALES_REP_HASH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.sales_rep_hash')
+SALES_REP_HASH_FILE = os.path.join(SCRIPT_DIR, '.sales_rep_hash')
 
 # Sales Rep Dashboard sheet name
 SALES_REP_SHEET_NAME = "Sales Rep Targets vs Actuals"
@@ -84,10 +97,7 @@ def load_config():
         config = json.loads(config_json)
     else:
         # Local development fallback - load from local file if exists
-        local_config_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            'local_config.json'
-        )
+        local_config_path = os.path.join(SCRIPT_DIR, 'local_config.json')
         if os.path.exists(local_config_path):
             with open(local_config_path, 'r') as f:
                 config = json.load(f)
@@ -129,10 +139,7 @@ def get_google_sheets_client():
         return gspread.authorize(creds)
     else:
         # Local development - use file
-        local_creds_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            'pullus-pipeline-40a5302e034d.json'
-        )
+        local_creds_path = os.path.join(SCRIPT_DIR, 'pullus-pipeline-40a5302e034d.json')
         return gspread.service_account(filename=local_creds_path)
 
 
@@ -415,83 +422,109 @@ def filter_chicken_egg(df):
     return chicken_df, egg_df
 
 
-def aggregate_by_staff_quarter_product(df, rep_config):
+def get_current_quarter_info():
     """
-    Aggregate revenue by staff, quarter, and product type.
-
-    Args:
-        df: DataFrame with staff_name, sheet_id, month, product_type, amount columns
-        rep_config: Dictionary mapping sheet_id to rep configuration
+    Return current quarter info based on WAT date.
 
     Returns:
-        Dictionary: {sheet_id: {quarter: {egg: amount, wc: amount}}}
+        Tuple of (quarter_label, quarter_months, elapsed_months)
+        Example for Feb 2026: ("Q1", ["Jan", "Feb", "Mar"], ["Jan", "Feb"])
+    """
+    now = datetime.now(WAT)
+    month_idx = now.month  # 1-12
+
+    quarter_num = (month_idx - 1) // 3 + 1
+    quarter_label = f"Q{quarter_num}"
+
+    quarter_start = (quarter_num - 1) * 3  # 0-based index into MONTH_ORDER
+    quarter_months = MONTH_ORDER[quarter_start:quarter_start + 3]
+
+    # Elapsed = all months in the quarter up to and including current month
+    months_into_quarter = month_idx - quarter_start
+    elapsed_months = quarter_months[:months_into_quarter]
+
+    return quarter_label, quarter_months, elapsed_months
+
+
+def aggregate_by_staff_month_product(df, sales_rep_config=None):
+    """
+    Aggregate revenue by staff, month, and product type for ALL staff.
+
+    Args:
+        df: DataFrame from extract_2026_revenue(preserve_staff_identity=True)
+        sales_rep_config: Optional sales_rep_dashboard config dict. If provided,
+                          applies exclude_staff and skip_records filters.
+
+    Returns:
+        Dictionary: {sheet_id: {month: {"egg": amount, "wc": amount}}}
     """
     if df.empty:
         return {}
 
-    quarter_mapping = {
-        'Jan': 'Q1', 'Feb': 'Q1', 'Mar': 'Q1',
-        'Apr': 'Q2', 'May': 'Q2', 'Jun': 'Q2',
-        'Jul': 'Q3', 'Aug': 'Q3', 'Sep': 'Q3',
-        'Oct': 'Q4', 'Nov': 'Q4', 'Dec': 'Q4'
-    }
+    df_copy = df.copy()
+
+    # Apply sales rep specific filters
+    if sales_rep_config:
+        # Exclude staff
+        exclude = set(sales_rep_config.get('exclude_staff', []))
+        if exclude:
+            df_copy = df_copy[~df_copy['sheet_id'].isin(exclude)]
+
+        # Skip first N records per sheet
+        skip_records = sales_rep_config.get('skip_records', {})
+        if skip_records:
+            to_drop = []
+            for sid, n in skip_records.items():
+                sid_indices = df_copy[df_copy['sheet_id'] == sid].index[:n]
+                to_drop.extend(sid_indices)
+            if to_drop:
+                df_copy = df_copy.drop(to_drop)
+
+    # Normalize month names (handle typos like "Febuary")
+    month_fixes = {'Febuary': 'Feb'}
+    df_copy['month'] = df_copy['month'].replace(month_fixes)
+
+    df_copy['product_category'] = df_copy['product_type'].str.lower().str.strip()
 
     result = {}
-
-    # Filter only for reps in config
-    rep_sheet_ids = set(rep_config.keys())
-
-    for sheet_id in rep_sheet_ids:
-        result[sheet_id] = {
-            'Q1': {'egg': 0, 'wc': 0},
-            'Q2': {'egg': 0, 'wc': 0},
-            'Q3': {'egg': 0, 'wc': 0},
-            'Q4': {'egg': 0, 'wc': 0}
-        }
-
-    # Filter for relevant sheet_ids
-    df_filtered = df[df['sheet_id'].isin(rep_sheet_ids)].copy()
-
-    if df_filtered.empty:
-        return result
-
-    # Add quarter column
-    df_filtered['quarter'] = df_filtered['month'].map(quarter_mapping)
-
-    # Normalize product type
-    df_filtered['product_category'] = df_filtered['product_type'].str.lower().str.strip()
-
-    for _, row in df_filtered.iterrows():
+    for _, row in df_copy.iterrows():
         sheet_id = row['sheet_id']
-        quarter = row['quarter']
+        month = row['month']
         product = row['product_category']
         amount = row['amount']
 
-        if quarter is None or sheet_id not in result:
-            continue
+        if sheet_id not in result:
+            result[sheet_id] = {}
+        if month not in result[sheet_id]:
+            result[sheet_id][month] = {'egg': 0, 'wc': 0}
 
         if product == 'whole chicken':
-            result[sheet_id][quarter]['wc'] += amount
+            result[sheet_id][month]['wc'] += amount
         elif product in ['egg', 'eggs']:
-            result[sheet_id][quarter]['egg'] += amount
+            result[sheet_id][month]['egg'] += amount
 
     return result
 
 
 @smart_retry(max_retries=3, initial_delay=2.0)
-def create_sales_rep_dashboard(config, staff_actuals):
+def create_sales_rep_dashboard(config, staff_month_actuals):
     """
     Create or update the Sales Rep Targets vs Actuals dashboard.
 
+    Shows separate WC and Eggs sections with monthly target breakdowns
+    for the current quarter and dynamic achieved columns as months elapse.
+
     Args:
         config: Configuration dictionary with sales_rep_dashboard section
-        staff_actuals: Dictionary from aggregate_by_staff_quarter_product()
+        staff_month_actuals: Dictionary from aggregate_by_staff_month_product()
+                             {sheet_id: {month: {"egg": amount, "wc": amount}}}
 
     Returns:
-        Tuple of (worksheet, formatting_data)
+        Tuple of (worksheet, formatting_metadata)
     """
     rep_config = config['sales_rep_dashboard']['reps']
     target_sheet_id = config['sales_rep_dashboard']['target_spreadsheet_id']
+    staff_sheets = config.get('staff_sheets', {})
 
     gc = get_google_sheets_client()
 
@@ -505,10 +538,15 @@ def create_sales_rep_dashboard(config, staff_actuals):
     except gspread.exceptions.WorksheetNotFound:
         pass
 
+    # Get current quarter info
+    quarter_label, quarter_months, elapsed_months = get_current_quarter_info()
+    # Columns: NAMES + month targets + QUARTER TARGET + month achieved + QUARTER ACHIEVED + % ACHIEVED
+    num_cols = 1 + len(quarter_months) + 1 + len(elapsed_months) + 1 + 1
+
     # Create new sheet with temporary name first
     temp_name = f"{SALES_REP_SHEET_NAME}_temp_{int(time.time())}"
     print("  Creating sheet...")
-    worksheet = spreadsheet.add_worksheet(title=temp_name, rows=50, cols=10)
+    worksheet = spreadsheet.add_worksheet(title=temp_name, rows=60, cols=num_cols + 2)
     time.sleep(1.0)
 
     # Now delete the old sheet (safe because we have the new one)
@@ -521,12 +559,155 @@ def create_sales_rep_dashboard(config, staff_actuals):
     worksheet.update_title(SALES_REP_SHEET_NAME)
     time.sleep(1.0)
 
-    # Build data
+    # Build the ordered rep list:
+    # 1. All reps from config (in config order) - have targets, may/may not have sheet_id
+    # 2. Staff from staff_sheets not already covered (excluding excluded) - have actuals, NIL targets
+    rep_list = []
+    covered_sheet_ids = set()
+    exclude_staff = set(config['sales_rep_dashboard'].get('exclude_staff', []))
+
+    for slug, rep_info in rep_config.items():
+        rep_list.append({
+            'slug': slug,
+            'name': rep_info['name'],
+            'sheet_id': rep_info.get('sheet_id'),
+            'monthly_targets': rep_info.get('monthly_targets', {}),
+        })
+        if rep_info.get('sheet_id'):
+            covered_sheet_ids.add(rep_info['sheet_id'])
+
+    # Add staff from staff_sheets not already in rep list and not excluded
+    for sheet_id, staff_name in staff_sheets.items():
+        if sheet_id not in covered_sheet_ids and sheet_id not in exclude_staff:
+            rep_list.append({
+                'slug': staff_name.lower(),
+                'name': staff_name.upper(),
+                'sheet_id': sheet_id,
+                'monthly_targets': {},
+            })
+
+    # Helper to format a value for display
+    def fmt_target(val):
+        if val == 0:
+            return "NIL"
+        return f"\u20a6{val:,.2f}"
+
+    def fmt_achieved(val):
+        if val is None:
+            return "NIL"
+        return f"\u20a6{val:,.2f}"
+
+    # Build section data for one or more product types
+    def build_section_data(product_keys):
+        """
+        Build rows for a product section.
+
+        Args:
+            product_keys: list of product keys, e.g. ['wc'], ['egg'], or ['wc', 'egg']
+
+        Returns:
+            (header_cols, data_rows, total_row, pct_values)
+            data_rows: list of lists (string values)
+            pct_values: list of (percentage_float_or_None) per data row + total row
+        """
+        # Column headers
+        header = ["NAMES"]
+        for m in quarter_months:
+            header.append(f"{m.upper()} TARGET")
+        header.append("QUARTER TARGET")
+        for m in elapsed_months:
+            header.append(f"{m.upper()} ACHIEVED")
+        header.append("QUARTER ACHIEVED")
+        header.append("% ACHIEVED")
+
+        data_rows = []
+        pct_values = []
+        num_target_cols = len(quarter_months) + 1
+        num_achieved_cols = len(elapsed_months)
+        totals_numeric = [0] * (num_target_cols + num_achieved_cols)
+        total_quarter_achieved = 0
+        total_quarter_target = 0
+
+        for rep in rep_list:
+            row = [rep['name']]
+            quarter_target_sum = 0
+
+            # Monthly targets from config (sum across all product keys)
+            for i, m in enumerate(quarter_months):
+                val = 0
+                for pk in product_keys:
+                    val += rep['monthly_targets'].get(quarter_label, {}).get(pk, {}).get(m, 0)
+                quarter_target_sum += val
+                row.append(fmt_target(val))
+                totals_numeric[i] += val
+
+            # Quarter target (sum)
+            row.append(fmt_target(quarter_target_sum))
+            totals_numeric[len(quarter_months)] += quarter_target_sum
+            total_quarter_target += quarter_target_sum
+
+            # Achieved columns (sum across all product keys)
+            sheet_id = rep.get('sheet_id')
+            has_sheet = sheet_id and sheet_id in staff_month_actuals
+            quarter_achieved_sum = 0
+            quarter_achieved_valid = False
+
+            for j, m in enumerate(elapsed_months):
+                if has_sheet:
+                    month_data = staff_month_actuals[sheet_id].get(m, {})
+                    val = sum(month_data.get(pk, 0) for pk in product_keys)
+                    row.append(fmt_achieved(val))
+                    totals_numeric[num_target_cols + j] += val
+                    quarter_achieved_sum += val
+                    quarter_achieved_valid = True
+                else:
+                    row.append("NIL")
+
+            # Quarter achieved (sum of elapsed months)
+            if quarter_achieved_valid:
+                row.append(fmt_achieved(quarter_achieved_sum))
+                total_quarter_achieved += quarter_achieved_sum
+                if quarter_target_sum > 0:
+                    pct = (quarter_achieved_sum / quarter_target_sum) * 100
+                    row.append(f"{pct:.1f}%")
+                    pct_values.append(pct)
+                else:
+                    row.append("-")
+                    pct_values.append(None)
+            else:
+                row.append("NIL")
+                row.append("NIL")
+                pct_values.append(None)
+
+            data_rows.append(row)
+
+        # Build TOTAL row
+        total_row = ["TOTAL"]
+        for i in range(num_target_cols):
+            total_row.append(fmt_target(totals_numeric[i]))
+        for i in range(num_achieved_cols):
+            total_row.append(fmt_achieved(totals_numeric[num_target_cols + i]))
+        total_row.append(fmt_achieved(total_quarter_achieved))
+        if total_quarter_target > 0:
+            total_pct = (total_quarter_achieved / total_quarter_target) * 100
+            total_row.append(f"{total_pct:.1f}%")
+            pct_values.append(total_pct)
+        else:
+            total_row.append("-")
+            pct_values.append(None)
+
+        return header, data_rows, total_row, pct_values
+
+    # Build all data
     all_data = []
-    formatting_data = []
+    fmt_meta = {
+        'num_cols': num_cols,
+        'quarter_label': quarter_label,
+    }
 
     # Row 1: Title
-    all_data.append(["SALES REP TARGETS VS ACTUALS DASHBOARD", "", "", "", "", "", "", "", ""])
+    title_row = ["SALES REP TARGETS VS ACTUALS DASHBOARD"] + [""] * (num_cols - 1)
+    all_data.append(title_row)
 
     # Row 2: Empty
     all_data.append([""])
@@ -537,219 +718,96 @@ def create_sales_rep_dashboard(config, staff_actuals):
     # Row 4: Empty
     all_data.append([""])
 
-    # Row 5: Headers
-    all_data.append([
-        "Name",
-        "Location",
-        "Business Contribution %",
-        "Quarterly Target Eggs",
-        "Quarterly Targets WC",
-        "Total Target (Egg+WC)",
-        "Total Achieved",
-        "Percentage Achieved%",
-        "Gap"
-    ])
+    # === WC Section ===
+    # Row 5: WC Section header
+    wc_section_header = [f"{quarter_label} WC QUARTER TARGET"] + [""] * (num_cols - 1)
+    all_data.append(wc_section_header)
+    fmt_meta['wc_section_header_row'] = len(all_data)  # 1-based
 
-    # Data rows: Each rep x 4 quarters + rep total + grand total
-    quarters = ['Q1', 'Q2', 'Q3', 'Q4']
+    # Row 6: WC Column headers
+    wc_header, wc_data_rows, wc_total_row, wc_pct_values = build_section_data(['wc'])
+    all_data.append(wc_header)
+    fmt_meta['wc_col_header_row'] = len(all_data)
 
-    # Track grand totals (only for quarters with data)
-    grand_egg_target = 0
-    grand_wc_target = 0
-    grand_total_target = 0
-    grand_total_achieved = 0
+    # WC Data rows
+    fmt_meta['wc_data_start_row'] = len(all_data) + 1
+    for row in wc_data_rows:
+        all_data.append(row)
+    fmt_meta['wc_data_end_row'] = len(all_data)
 
-    for sheet_id, rep_info in rep_config.items():
-        rep_name = rep_info['name']
-        location = rep_info['location']
-        contribution = rep_info['business_contribution']
-        egg_target = rep_info['quarterly_targets']['egg']
-        wc_target = rep_info['quarterly_targets']['wc']
-        total_target = egg_target + wc_target
+    # WC Total row
+    all_data.append(wc_total_row)
+    fmt_meta['wc_total_row'] = len(all_data)
+    fmt_meta['wc_pct_values'] = wc_pct_values  # data rows + total row
 
-        # Track rep yearly totals (quarterly × 4)
-        rep_yearly_egg_target = egg_target * 4
-        rep_yearly_wc_target = wc_target * 4
-        rep_yearly_total_target = total_target * 4
-        rep_total_achieved = 0
+    # Empty row between sections
+    all_data.append([""])
 
-        for quarter in quarters:
-            # Get actuals
-            if sheet_id in staff_actuals:
-                egg_actual = staff_actuals[sheet_id][quarter]['egg']
-                wc_actual = staff_actuals[sheet_id][quarter]['wc']
-            else:
-                egg_actual = 0
-                wc_actual = 0
+    # === Eggs Section ===
+    egg_section_header = [f"{quarter_label} EGGS TARGETS"] + [""] * (num_cols - 1)
+    all_data.append(egg_section_header)
+    fmt_meta['egg_section_header_row'] = len(all_data)
 
-            total_actual = egg_actual + wc_actual
-            rep_total_achieved += total_actual
+    # Egg Column headers
+    egg_header, egg_data_rows, egg_total_row, egg_pct_values = build_section_data(['egg'])
+    all_data.append(egg_header)
+    fmt_meta['egg_col_header_row'] = len(all_data)
 
-            # Format the name with quarter
-            name_with_quarter = f"{rep_name} ({quarter})"
+    # Egg Data rows
+    fmt_meta['egg_data_start_row'] = len(all_data) + 1
+    for row in egg_data_rows:
+        all_data.append(row)
+    fmt_meta['egg_data_end_row'] = len(all_data)
 
-            # Only calculate percentage and gap if there's actual data
-            if total_actual > 0:
-                percentage = (total_actual / total_target) * 100 if total_target > 0 else 0
-                gap = total_actual - total_target
+    # Egg Total row
+    all_data.append(egg_total_row)
+    fmt_meta['egg_total_row'] = len(all_data)
+    fmt_meta['egg_pct_values'] = egg_pct_values
 
-                row_data = [
-                    name_with_quarter,
-                    location,
-                    f"{contribution * 100:.0f}%",
-                    format_currency(egg_target),
-                    format_currency(wc_target),
-                    format_currency(total_target),
-                    format_currency(total_actual),
-                    f"{percentage:.1f}%",
-                    format_currency(gap)
-                ]
+    # Empty row between sections
+    all_data.append([""])
 
-                # Track formatting data (only for rows with actual data)
-                formatting_data.append({
-                    'row_has_data': True,
-                    'is_total_row': False,
-                    'percentage': percentage,
-                    'gap': gap
-                })
-            else:
-                # No actual data for this quarter - show dashes
-                row_data = [
-                    name_with_quarter,
-                    location,
-                    f"{contribution * 100:.0f}%",
-                    format_currency(egg_target),
-                    format_currency(wc_target),
-                    format_currency(total_target),
-                    "-",
-                    "-",
-                    "-"
-                ]
+    # === Combined Section ===
+    combined_section_header = [f"{quarter_label} COMBINED TARGETS (WC + EGGS)"] + [""] * (num_cols - 1)
+    all_data.append(combined_section_header)
+    fmt_meta['combined_section_header_row'] = len(all_data)
 
-                # No conditional formatting needed for empty rows
-                formatting_data.append({
-                    'row_has_data': False,
-                    'is_total_row': False,
-                    'percentage': 0,
-                    'gap': 0
-                })
+    # Combined Column headers
+    combined_header, combined_data_rows, combined_total_row, combined_pct_values = build_section_data(['wc', 'egg'])
+    all_data.append(combined_header)
+    fmt_meta['combined_col_header_row'] = len(all_data)
 
-            all_data.append(row_data)
+    # Combined Data rows
+    fmt_meta['combined_data_start_row'] = len(all_data) + 1
+    for row in combined_data_rows:
+        all_data.append(row)
+    fmt_meta['combined_data_end_row'] = len(all_data)
 
-        # Add rep total row (yearly targets, actual achieved so far)
-        if rep_total_achieved > 0:
-            rep_percentage = (rep_total_achieved / rep_yearly_total_target) * 100 if rep_yearly_total_target > 0 else 0
-            rep_gap = rep_total_achieved - rep_yearly_total_target
-
-            rep_total_row = [
-                f"{rep_name} TOTAL",
-                "-",
-                "-",
-                format_currency(rep_yearly_egg_target),
-                format_currency(rep_yearly_wc_target),
-                format_currency(rep_yearly_total_target),
-                format_currency(rep_total_achieved),
-                f"{rep_percentage:.1f}%",
-                format_currency(rep_gap)
-            ]
-
-            formatting_data.append({
-                'row_has_data': True,
-                'is_total_row': True,
-                'percentage': rep_percentage,
-                'gap': rep_gap
-            })
-        else:
-            # No data for any quarter - still show yearly targets
-            rep_total_row = [
-                f"{rep_name} TOTAL",
-                "-",
-                "-",
-                format_currency(rep_yearly_egg_target),
-                format_currency(rep_yearly_wc_target),
-                format_currency(rep_yearly_total_target),
-                "-",
-                "-",
-                "-"
-            ]
-
-            formatting_data.append({
-                'row_has_data': False,
-                'is_total_row': True,
-                'percentage': 0,
-                'gap': 0
-            })
-
-        all_data.append(rep_total_row)
-
-        # Add to grand totals (yearly)
-        grand_egg_target += rep_yearly_egg_target
-        grand_wc_target += rep_yearly_wc_target
-        grand_total_target += rep_yearly_total_target
-        grand_total_achieved += rep_total_achieved
-
-    # Add grand total row
-    if grand_total_achieved > 0:
-        grand_percentage = (grand_total_achieved / grand_total_target) * 100 if grand_total_target > 0 else 0
-        grand_gap = grand_total_achieved - grand_total_target
-
-        grand_total_row = [
-            "GRAND TOTAL",
-            "-",
-            "-",
-            format_currency(grand_egg_target),
-            format_currency(grand_wc_target),
-            format_currency(grand_total_target),
-            format_currency(grand_total_achieved),
-            f"{grand_percentage:.1f}%",
-            format_currency(grand_gap)
-        ]
-
-        formatting_data.append({
-            'row_has_data': True,
-            'is_total_row': True,
-            'percentage': grand_percentage,
-            'gap': grand_gap
-        })
-    else:
-        grand_total_row = [
-            "GRAND TOTAL",
-            "-",
-            "-",
-            format_currency(grand_egg_target),
-            format_currency(grand_wc_target),
-            format_currency(grand_total_target),
-            "-",
-            "-",
-            "-"
-        ]
-
-        formatting_data.append({
-            'row_has_data': False,
-            'is_total_row': True,
-            'percentage': 0,
-            'gap': 0
-        })
-
-    all_data.append(grand_total_row)
+    # Combined Total row
+    all_data.append(combined_total_row)
+    fmt_meta['combined_total_row'] = len(all_data)
+    fmt_meta['combined_pct_values'] = combined_pct_values
 
     # Write all data
     print("  Writing data...")
     worksheet.update('A1', all_data, value_input_option='RAW')
     time.sleep(1.0)
 
-    return worksheet, formatting_data
+    return worksheet, fmt_meta
 
 
-def apply_sales_rep_formatting(worksheet, formatting_data):
+def apply_sales_rep_formatting(worksheet, fmt):
     """
     Apply professional formatting to the sales rep dashboard.
 
     Args:
         worksheet: The gspread worksheet object
-        formatting_data: List of dicts with 'percentage' and 'gap' values for each data row
+        fmt: Dictionary with row numbers for formatting metadata
     """
     print("  Applying formatting (batch mode)...")
+
+    num_cols = fmt['num_cols']
+    last_col = chr(ord('A') + num_cols - 1)  # e.g. 'G' for 7 cols
 
     # Define formats
     title_format = CellFormat(
@@ -763,7 +821,13 @@ def apply_sales_rep_formatting(worksheet, formatting_data):
         horizontalAlignment='LEFT'
     )
 
-    header_format = CellFormat(
+    section_header_format = CellFormat(
+        backgroundColor=Color(**COLORS['header']),
+        textFormat=TextFormat(bold=True, fontSize=11, foregroundColor=Color(1, 1, 1)),
+        horizontalAlignment='LEFT'
+    )
+
+    col_header_format = CellFormat(
         backgroundColor=Color(**COLORS['subheader']),
         textFormat=TextFormat(bold=True, fontSize=10),
         horizontalAlignment='CENTER',
@@ -797,16 +861,6 @@ def apply_sales_rep_formatting(worksheet, formatting_data):
         )
     )
 
-    green_format = CellFormat(
-        backgroundColor=Color(**COLORS['positive']),
-        textFormat=TextFormat(bold=True)
-    )
-
-    red_format = CellFormat(
-        backgroundColor=Color(**COLORS['negative']),
-        textFormat=TextFormat(bold=True)
-    )
-
     total_row_format = CellFormat(
         backgroundColor=Color(**COLORS['total_row']),
         textFormat=TextFormat(bold=True),
@@ -831,76 +885,106 @@ def apply_sales_rep_formatting(worksheet, formatting_data):
         )
     )
 
-    # Calculate the last row (5 header rows + data rows)
-    num_data_rows = len(formatting_data)
-    last_data_row = 5 + num_data_rows
-
     # Batch 1: Base formatting
+    wc_sh = fmt['wc_section_header_row']
+    wc_ch = fmt['wc_col_header_row']
+    wc_ds = fmt['wc_data_start_row']
+    wc_de = fmt['wc_data_end_row']
+    wc_tr = fmt['wc_total_row']
+    egg_sh = fmt['egg_section_header_row']
+    egg_ch = fmt['egg_col_header_row']
+    egg_ds = fmt['egg_data_start_row']
+    egg_de = fmt['egg_data_end_row']
+    egg_tr = fmt['egg_total_row']
+    comb_sh = fmt['combined_section_header_row']
+    comb_ch = fmt['combined_col_header_row']
+    comb_ds = fmt['combined_data_start_row']
+    comb_de = fmt['combined_data_end_row']
+    comb_tr = fmt['combined_total_row']
+
     base_formats = [
-        ('A1:I1', title_format),
-        ('A3:I3', updated_format),
-        ('A5:I5', header_format),
-        (f'A6:A{last_data_row}', name_format),
-        (f'B6:I{last_data_row}', data_format),
+        # Title and updated
+        (f'A1:{last_col}1', title_format),
+        (f'A3:{last_col}3', updated_format),
+        # WC section
+        (f'A{wc_sh}:{last_col}{wc_sh}', section_header_format),
+        (f'A{wc_ch}:{last_col}{wc_ch}', col_header_format),
+        (f'A{wc_ds}:A{wc_de}', name_format),
+        (f'B{wc_ds}:{last_col}{wc_de}', data_format),
+        (f'A{wc_tr}', total_row_name_format),
+        (f'B{wc_tr}:{last_col}{wc_tr}', total_row_format),
+        # Egg section
+        (f'A{egg_sh}:{last_col}{egg_sh}', section_header_format),
+        (f'A{egg_ch}:{last_col}{egg_ch}', col_header_format),
+        (f'A{egg_ds}:A{egg_de}', name_format),
+        (f'B{egg_ds}:{last_col}{egg_de}', data_format),
+        (f'A{egg_tr}', total_row_name_format),
+        (f'B{egg_tr}:{last_col}{egg_tr}', total_row_format),
+        # Combined section
+        (f'A{comb_sh}:{last_col}{comb_sh}', section_header_format),
+        (f'A{comb_ch}:{last_col}{comb_ch}', col_header_format),
+        (f'A{comb_ds}:A{comb_de}', name_format),
+        (f'B{comb_ds}:{last_col}{comb_de}', data_format),
+        (f'A{comb_tr}', total_row_name_format),
+        (f'B{comb_tr}:{last_col}{comb_tr}', total_row_format),
     ]
 
     format_cell_ranges(worksheet, base_formats)
     time.sleep(2.0)
 
-    # Merge title cells
-    worksheet.merge_cells('A1:I1')
+    # Merge title and section headers
+    worksheet.merge_cells(f'A1:{last_col}1')
+    time.sleep(0.5)
+    worksheet.merge_cells(f'A{wc_sh}:{last_col}{wc_sh}')
+    time.sleep(0.5)
+    worksheet.merge_cells(f'A{egg_sh}:{last_col}{egg_sh}')
+    time.sleep(0.5)
+    worksheet.merge_cells(f'A{comb_sh}:{last_col}{comb_sh}')
     time.sleep(1.0)
 
-    # Batch 2: Total row formatting
-    total_row_formats = []
-    for i, fmt_data in enumerate(formatting_data):
-        row = 6 + i  # Data starts at row 6
-        if fmt_data.get('is_total_row', False):
-            total_row_formats.append((f'A{row}', total_row_name_format))
-            total_row_formats.append((f'B{row}:I{row}', total_row_format))
-
-    if total_row_formats:
-        format_cell_ranges(worksheet, total_row_formats)
-        time.sleep(2.0)
-
-    # Batch 3: Conditional formatting for percentage and gap columns (only for rows with data)
+    # Batch 2: Conditional formatting for % ACHIEVED column
+    pct_col = last_col  # % ACHIEVED is the last column
     conditional_formats = []
 
-    for i, fmt_data in enumerate(formatting_data):
-        row = 6 + i  # Data starts at row 6
+    # WC section: data rows + total row
+    wc_pct = fmt.get('wc_pct_values', [])
+    for i, pct in enumerate(wc_pct):
+        if pct is not None:
+            row = wc_ds + i if i < len(wc_pct) - 1 else wc_tr
+            color_fmt = GREEN_FORMAT if pct >= 100 else RED_FORMAT
+            conditional_formats.append((f'{pct_col}{row}', color_fmt))
 
-        # Only apply conditional formatting to rows with actual data
-        if fmt_data.get('row_has_data', False):
-            # Percentage column (H) - green if >= 100%, red if < 100%
-            pct_fmt = green_format if fmt_data['percentage'] >= 100 else red_format
-            conditional_formats.append((f'H{row}', pct_fmt))
+    # Egg section: data rows + total row
+    egg_pct = fmt.get('egg_pct_values', [])
+    for i, pct in enumerate(egg_pct):
+        if pct is not None:
+            row = egg_ds + i if i < len(egg_pct) - 1 else egg_tr
+            color_fmt = GREEN_FORMAT if pct >= 100 else RED_FORMAT
+            conditional_formats.append((f'{pct_col}{row}', color_fmt))
 
-            # Gap column (I) - green if >= 0, red if < 0
-            gap_fmt = green_format if fmt_data['gap'] >= 0 else red_format
-            conditional_formats.append((f'I{row}', gap_fmt))
+    # Combined section: data rows + total row
+    comb_pct = fmt.get('combined_pct_values', [])
+    for i, pct in enumerate(comb_pct):
+        if pct is not None:
+            row = comb_ds + i if i < len(comb_pct) - 1 else comb_tr
+            color_fmt = GREEN_FORMAT if pct >= 100 else RED_FORMAT
+            conditional_formats.append((f'{pct_col}{row}', color_fmt))
 
     if conditional_formats:
         format_cell_ranges(worksheet, conditional_formats)
         time.sleep(2.0)
 
     # Set column widths
-    widths = [
-        ('A', 150),  # Name
-        ('B', 110),  # Location
-        ('C', 180),  # Business Contribution
-        ('D', 180),  # Quarterly Target Eggs
-        ('E', 180),  # Quarterly Targets WC
-        ('F', 190),  # Total Target
-        ('G', 160),  # Total Achieved
-        ('H', 180),  # Percentage Achieved
-        ('I', 180),  # Gap
-    ]
-    for col, width in widths:
-        set_column_width(worksheet, col, width)
+    for col_idx in range(num_cols):
+        col_letter = chr(ord('A') + col_idx)
+        if col_idx == 0:
+            set_column_width(worksheet, col_letter, 190)
+        else:
+            set_column_width(worksheet, col_letter, 180)
     time.sleep(1.0)
 
-    # Freeze header rows
-    set_frozen(worksheet, rows=5)
+    # Freeze rows at row 4 (above first section)
+    set_frozen(worksheet, rows=4)
 
 
 def calculate_yoy_variance(current, previous):
@@ -1242,16 +1326,6 @@ def apply_professional_formatting(worksheet, target_percentages=None, monthly_va
 
     label_format = CellFormat(horizontalAlignment='LEFT')
 
-    green_format = CellFormat(
-        backgroundColor=Color(**COLORS['positive']),
-        textFormat=TextFormat(bold=True)
-    )
-
-    red_format = CellFormat(
-        backgroundColor=Color(**COLORS['negative']),
-        textFormat=TextFormat(bold=True)
-    )
-
     # Batch 1: Base formatting (headers, data areas, totals)
     base_formats = [
         ('A1:J1', title_format),
@@ -1288,9 +1362,9 @@ def apply_professional_formatting(worksheet, target_percentages=None, monthly_va
         for i, var_data in enumerate(monthly_variances):
             row = 7 + i
             if var_data['var_2026_vs_2025'] is not None:
-                fmt = green_format if var_data['var_2026_vs_2025'] >= 0 else red_format
+                fmt = GREEN_FORMAT if var_data['var_2026_vs_2025'] >= 0 else RED_FORMAT
                 conditional_formats.append((f'C{row}', fmt))
-            fmt = green_format if var_data['var_2025_vs_2024'] >= 0 else red_format
+            fmt = GREEN_FORMAT if var_data['var_2025_vs_2024'] >= 0 else RED_FORMAT
             conditional_formats.append((f'E{row}', fmt))
 
     # Quarterly variances (Rows 23-27)
@@ -1298,20 +1372,20 @@ def apply_professional_formatting(worksheet, target_percentages=None, monthly_va
         for i, var_data in enumerate(quarterly_variances):
             row = 23 + i
             if var_data['var_2026_vs_2025'] is not None:
-                fmt = green_format if var_data['var_2026_vs_2025'] >= 0 else red_format
+                fmt = GREEN_FORMAT if var_data['var_2026_vs_2025'] >= 0 else RED_FORMAT
                 conditional_formats.append((f'C{row}', fmt))
-            fmt = green_format if var_data['var_2025_vs_2024'] >= 0 else red_format
+            fmt = GREEN_FORMAT if var_data['var_2025_vs_2024'] >= 0 else RED_FORMAT
             conditional_formats.append((f'E{row}', fmt))
 
     # Target percentages (Rows 31-35)
     if target_percentages:
         for i, pct_data in enumerate(target_percentages):
             row = 31 + i
-            chicken_fmt = green_format if pct_data['chicken'] >= 100 else red_format
+            chicken_fmt = GREEN_FORMAT if pct_data['chicken'] >= 100 else RED_FORMAT
             conditional_formats.append((f'C{row}:D{row}', chicken_fmt))
-            egg_fmt = green_format if pct_data['egg'] >= 100 else red_format
+            egg_fmt = GREEN_FORMAT if pct_data['egg'] >= 100 else RED_FORMAT
             conditional_formats.append((f'F{row}:G{row}', egg_fmt))
-            combined_fmt = green_format if pct_data['combined'] >= 100 else red_format
+            combined_fmt = GREEN_FORMAT if pct_data['combined'] >= 100 else RED_FORMAT
             conditional_formats.append((f'I{row}:J{row}', combined_fmt))
 
     if conditional_formats:
@@ -1421,21 +1495,20 @@ def main():
             stored_sales_rep_hash = get_sales_rep_stored_hash()
             if stored_sales_rep_hash == current_hash:
                 print("\nNo changes detected - skipping sales rep dashboard update")
-            elif df_2026.empty:
-                print("  Warning: No data for sales rep dashboard")
             else:
-                print("\nChanges detected - proceeding with sales rep dashboard update...")
+                print("\nProceeding with sales rep dashboard update...")
 
-                # Aggregate by staff, quarter, and product
-                staff_actuals = aggregate_by_staff_quarter_product(df_2026, rep_config)
+                # Aggregate by staff, month, and product (empty dict if no data)
+                sales_rep_cfg = config['sales_rep_dashboard']
+                staff_month_actuals = aggregate_by_staff_month_product(df_2026, sales_rep_cfg) if not df_2026.empty else {}
 
                 # Create the sales rep dashboard
                 print("\nStep 2: Updating sales rep dashboard...")
-                worksheet, formatting_data = create_sales_rep_dashboard(config, staff_actuals)
+                worksheet, fmt_meta = create_sales_rep_dashboard(config, staff_month_actuals)
 
                 # Apply formatting
                 print("\nStep 3: Applying formatting...")
-                apply_sales_rep_formatting(worksheet, formatting_data)
+                apply_sales_rep_formatting(worksheet, fmt_meta)
 
                 # Store the new hash
                 store_sales_rep_hash(current_hash)
