@@ -540,8 +540,8 @@ def create_sales_rep_dashboard(config, staff_month_actuals):
 
     # Get current quarter info
     quarter_label, quarter_months, elapsed_months = get_current_quarter_info()
-    # Columns: NAMES + month targets + QUARTER TARGET + month achieved + QUARTER ACHIEVED + % ACHIEVED
-    num_cols = 1 + len(quarter_months) + 1 + len(elapsed_months) + 1 + 1
+    # Columns: NAMES + (target + achieved pairs for elapsed months) + (target-only for remaining months) + QUARTER TARGET + QUARTER ACHIEVED + % ACHIEVED
+    num_cols = 1 + len(elapsed_months) * 2 + (len(quarter_months) - len(elapsed_months)) + 1 + 1 + 1
 
     # Create new sheet with temporary name first
     temp_name = f"{SALES_REP_SHEET_NAME}_temp_{int(time.time())}"
@@ -600,7 +600,11 @@ def create_sales_rep_dashboard(config, staff_month_actuals):
     # Build section data for one or more product types
     def build_section_data(product_keys):
         """
-        Build rows for a product section.
+        Build rows for a product section with target/achieved paired side by side.
+
+        For elapsed months: TARGET | ACHIEVED columns paired together
+        For future months: TARGET column only
+        Then: QUARTER TARGET | QUARTER ACHIEVED | % ACHIEVED
 
         Args:
             product_keys: list of product keys, e.g. ['wc'], ['egg'], or ['wc', 'egg']
@@ -610,60 +614,62 @@ def create_sales_rep_dashboard(config, staff_month_actuals):
             data_rows: list of lists (string values)
             pct_values: list of (percentage_float_or_None) per data row + total row
         """
-        # Column headers
+        # Column headers - pair target/achieved for elapsed months
         header = ["NAMES"]
         for m in quarter_months:
             header.append(f"{m.upper()} TARGET")
+            if m in elapsed_months:
+                header.append(f"{m.upper()} ACHIEVED")
         header.append("QUARTER TARGET")
-        for m in elapsed_months:
-            header.append(f"{m.upper()} ACHIEVED")
         header.append("QUARTER ACHIEVED")
         header.append("% ACHIEVED")
 
         data_rows = []
         pct_values = []
-        num_target_cols = len(quarter_months) + 1
-        num_achieved_cols = len(elapsed_months)
-        totals_numeric = [0] * (num_target_cols + num_achieved_cols)
-        total_quarter_achieved = 0
+
+        # Track totals for each numeric column (targets + achieved)
+        # Column indices: for each month, target + maybe achieved, then quarter target, quarter achieved
+        target_totals = {m: 0 for m in quarter_months}
+        achieved_totals = {m: 0 for m in elapsed_months}
         total_quarter_target = 0
+        total_quarter_achieved = 0
 
         for rep in rep_list:
             row = [rep['name']]
             quarter_target_sum = 0
 
-            # Monthly targets from config (sum across all product keys)
-            for i, m in enumerate(quarter_months):
-                val = 0
-                for pk in product_keys:
-                    val += rep['monthly_targets'].get(quarter_label, {}).get(pk, {}).get(m, 0)
-                quarter_target_sum += val
-                row.append(fmt_target(val))
-                totals_numeric[i] += val
-
-            # Quarter target (sum)
-            row.append(fmt_target(quarter_target_sum))
-            totals_numeric[len(quarter_months)] += quarter_target_sum
-            total_quarter_target += quarter_target_sum
-
-            # Achieved columns (sum across all product keys)
+            # Per-rep achieved tracking
             sheet_id = rep.get('sheet_id')
             has_sheet = sheet_id and sheet_id in staff_month_actuals
             quarter_achieved_sum = 0
             quarter_achieved_valid = False
 
-            for j, m in enumerate(elapsed_months):
-                if has_sheet:
-                    month_data = staff_month_actuals[sheet_id].get(m, {})
-                    val = sum(month_data.get(pk, 0) for pk in product_keys)
-                    row.append(fmt_achieved(val))
-                    totals_numeric[num_target_cols + j] += val
-                    quarter_achieved_sum += val
-                    quarter_achieved_valid = True
-                else:
-                    row.append("NIL")
+            for m in quarter_months:
+                # Target
+                val = 0
+                for pk in product_keys:
+                    val += rep['monthly_targets'].get(quarter_label, {}).get(pk, {}).get(m, 0)
+                quarter_target_sum += val
+                row.append(fmt_target(val))
+                target_totals[m] += val
 
-            # Quarter achieved (sum of elapsed months)
+                # Achieved (only for elapsed months)
+                if m in elapsed_months:
+                    if has_sheet:
+                        month_data = staff_month_actuals[sheet_id].get(m, {})
+                        ach = sum(month_data.get(pk, 0) for pk in product_keys)
+                        row.append(fmt_achieved(ach))
+                        achieved_totals[m] += ach
+                        quarter_achieved_sum += ach
+                        quarter_achieved_valid = True
+                    else:
+                        row.append("NIL")
+
+            # Quarter target
+            row.append(fmt_target(quarter_target_sum))
+            total_quarter_target += quarter_target_sum
+
+            # Quarter achieved
             if quarter_achieved_valid:
                 row.append(fmt_achieved(quarter_achieved_sum))
                 total_quarter_achieved += quarter_achieved_sum
@@ -683,10 +689,11 @@ def create_sales_rep_dashboard(config, staff_month_actuals):
 
         # Build TOTAL row
         total_row = ["TOTAL"]
-        for i in range(num_target_cols):
-            total_row.append(fmt_target(totals_numeric[i]))
-        for i in range(num_achieved_cols):
-            total_row.append(fmt_achieved(totals_numeric[num_target_cols + i]))
+        for m in quarter_months:
+            total_row.append(fmt_target(target_totals[m]))
+            if m in elapsed_months:
+                total_row.append(fmt_achieved(achieved_totals[m]))
+        total_row.append(fmt_target(total_quarter_target))
         total_row.append(fmt_achieved(total_quarter_achieved))
         if total_quarter_target > 0:
             total_pct = (total_quarter_achieved / total_quarter_target) * 100
