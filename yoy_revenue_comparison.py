@@ -1444,8 +1444,12 @@ def main():
     print("YoY Revenue Comparison Sync")
     print("=" * 50)
 
+    is_scheduled_ci = os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('FORCE_UPDATE', '').lower() != 'true'
+    if not is_scheduled_ci:
+        print("\nLocal/manual run detected - forcing update (skipping hash check)")
+
     stored_hash = get_stored_hash()
-    if stored_hash == current_hash:
+    if is_scheduled_ci and stored_hash == current_hash:
         print("\nNo changes detected - skipping YoY dashboard update")
     else:
         if df_2026.empty:
@@ -1500,7 +1504,7 @@ def main():
         else:
             # Check if sales rep data has changed (same source data, separate hash)
             stored_sales_rep_hash = get_sales_rep_stored_hash()
-            if stored_sales_rep_hash == current_hash:
+            if is_scheduled_ci and stored_sales_rep_hash == current_hash:
                 print("\nNo changes detected - skipping sales rep dashboard update")
             else:
                 print("\nProceeding with sales rep dashboard update...")

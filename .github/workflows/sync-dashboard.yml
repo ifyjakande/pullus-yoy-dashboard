@@ -28,9 +28,11 @@ jobs:
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SHEET_CONFIG: ${{ secrets.SHEET_CONFIG }}
+          FORCE_UPDATE: ${{ github.event_name == 'workflow_dispatch' }}
         run: python yoy_revenue_comparison.py
 
       - name: Commit hash if changed
+        if: github.event_name == 'schedule'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
