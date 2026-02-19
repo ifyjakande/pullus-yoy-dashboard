@@ -16,6 +16,11 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import pandas as pd
 import gspread
+from gspread.exceptions import APIError
+from gspread_formatting import (
+    format_cell_ranges, CellFormat, Color, TextFormat,
+    set_column_width, set_frozen, Border, Borders
+)
 import time
 import functools
 import hashlib
@@ -26,11 +31,6 @@ from datetime import datetime, timezone, timedelta
 
 # West Africa Time (WAT) is UTC+1
 WAT = timezone(timedelta(hours=1))
-from gspread.exceptions import APIError
-from gspread_formatting import (
-    format_cell_range, format_cell_ranges, CellFormat, Color, TextFormat,
-    set_column_width, set_frozen, Border, Borders
-)
 
 # Default sheet name (not sensitive)
 TARGET_SHEET_NAME = "YoY Revenue Comparison"
@@ -318,19 +318,8 @@ def extract_2026_revenue(config, preserve_staff_identity=False):
             if 'product_type' in df.columns:
                 df['product_type'] = df['product_type'].astype(str).str.strip()
 
-            # Parse month from month column or date column
-            if 'month' in df.columns:
-                df['month'] = df['month'].astype(str).str.strip().str.title()
-                # Handle full month names
-                month_mapping = {
-                    'January': 'Jan', 'February': 'Feb', 'March': 'Mar',
-                    'April': 'Apr', 'May': 'May', 'June': 'Jun',
-                    'July': 'Jul', 'August': 'Aug', 'September': 'Sep',
-                    'October': 'Oct', 'November': 'Nov', 'December': 'Dec'
-                }
-                df['month'] = df['month'].replace(month_mapping)
-            elif 'date' in df.columns:
-                # Parse month from date column
+            # Parse month from date column (avoids typos in manual month entries)
+            if 'date' in df.columns:
                 df['date'] = pd.to_datetime(df['date'], errors='coerce')
                 df['month'] = df['date'].dt.strftime('%b')
 
@@ -1369,20 +1358,16 @@ def apply_professional_formatting(worksheet, target_percentages=None, monthly_va
         for i, var_data in enumerate(monthly_variances):
             row = 7 + i
             if var_data['var_2026_vs_2025'] is not None:
-                fmt = GREEN_FORMAT if var_data['var_2026_vs_2025'] >= 0 else RED_FORMAT
-                conditional_formats.append((f'C{row}', fmt))
-            fmt = GREEN_FORMAT if var_data['var_2025_vs_2024'] >= 0 else RED_FORMAT
-            conditional_formats.append((f'E{row}', fmt))
+                conditional_formats.append((f'C{row}', GREEN_FORMAT if var_data['var_2026_vs_2025'] >= 0 else RED_FORMAT))
+            conditional_formats.append((f'E{row}', GREEN_FORMAT if var_data['var_2025_vs_2024'] >= 0 else RED_FORMAT))
 
     # Quarterly variances (Rows 23-27)
     if quarterly_variances:
         for i, var_data in enumerate(quarterly_variances):
             row = 23 + i
             if var_data['var_2026_vs_2025'] is not None:
-                fmt = GREEN_FORMAT if var_data['var_2026_vs_2025'] >= 0 else RED_FORMAT
-                conditional_formats.append((f'C{row}', fmt))
-            fmt = GREEN_FORMAT if var_data['var_2025_vs_2024'] >= 0 else RED_FORMAT
-            conditional_formats.append((f'E{row}', fmt))
+                conditional_formats.append((f'C{row}', GREEN_FORMAT if var_data['var_2026_vs_2025'] >= 0 else RED_FORMAT))
+            conditional_formats.append((f'E{row}', GREEN_FORMAT if var_data['var_2025_vs_2024'] >= 0 else RED_FORMAT))
 
     # Target percentages (Rows 31-35)
     if target_percentages:
